@@ -1,4 +1,7 @@
 
+<img width="1254" height="1254" alt="ChatGPT Image Sep 12, 2026, 10_42_38 PM" src="https://github.com/user-attachments/assets/b343166f-3ac4-4ef3-8772-a4b5d514f288" />
+
+
 # TOAR — Tool-Oriented Agentic Runtime
 
 A production-grade, fully asynchronous C++23 agentic AI runtime that orchestrates Reason-Act-Tool (ReAct) loops with local and cloud LLMs. Built entirely from first principles with **zero external dependencies** — no boost, no asio, no nlohmann, no libcurl, no cpp-httplib. Every layer, from JSON parsing to coroutine scheduling to MCP transport, is hand-written in modern C++23.
