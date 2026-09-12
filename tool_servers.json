@@ -1,0 +1,46 @@
+{
+  "mcp_servers": [
+    {
+      "name": "mcp-filesystem",
+      "transport": "stdio",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "enabled": true,
+      "description": "Official Anthropic MCP Filesystem Server"
+    },
+    {
+      "name": "playwright",
+      "transport": "http",
+      "url": "http://localhost:8931/mcp",
+      "enabled": true,
+      "description": "Microsoft Playwright MCP Server"
+    },
+    {
+      "name": "fetch",
+      "transport": "stdio",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-fetch"],
+      "enabled": false,
+      "description": "Fetches a URL and returns it as clean Markdown"
+    },
+    {
+      "name": "sequential-thinking",
+      "transport": "stdio",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "enabled": true,
+      "description": "Dynamic and reflective problem-solving through thought sequences"
+    },
+    {
+      "name": "python-interpreter",
+      "transport": "stdio",
+      "command": ["bash", "-c", "cd /Users/pooriayousefi/github.com/pooriayousefi/python-mcp-server && clj -M:run"],
+      "enabled": true,
+      "description": "Clojure MCP server wrapping a Python scientific venv"
+    },
+    {
+      "name": "shell",
+      "transport": "stdio",
+      "command": ["./bin/mcp_shell_server"],
+      "enabled": true,
+      "description": "Shell command execution server"
+    }
+  ]
+}
