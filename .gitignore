@@ -1,4 +1,11 @@
-/bin
+bin/
+build/
+*.o
+*.obj
+*.out
 README.html
 .DS_Store
 toar-agent-16577257983612846794-2026-09-12-21-15-07.txt
+*.log
+logs/
+.vscode/

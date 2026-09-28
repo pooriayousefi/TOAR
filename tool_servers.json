@@ -1,46 +1,74 @@
 {
   "mcp_servers": [
     {
-      "name": "mcp-filesystem",
-      "transport": "stdio",
-      "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
-      "enabled": true,
-      "description": "Official Anthropic MCP Filesystem Server"
-    },
-    {
-      "name": "playwright",
-      "transport": "http",
-      "url": "http://localhost:8931/mcp",
-      "enabled": true,
-      "description": "Microsoft Playwright MCP Server"
-    },
-    {
-      "name": "fetch",
-      "transport": "stdio",
-      "command": ["npx", "-y", "@modelcontextprotocol/server-fetch"],
-      "enabled": false,
-      "description": "Fetches a URL and returns it as clean Markdown"
-    },
-    {
-      "name": "sequential-thinking",
-      "transport": "stdio",
-      "command": ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
-      "enabled": true,
-      "description": "Dynamic and reflective problem-solving through thought sequences"
-    },
-    {
-      "name": "python-interpreter",
-      "transport": "stdio",
-      "command": ["bash", "-c", "cd /Users/pooriayousefi/github.com/pooriayousefi/python-mcp-server && clj -M:run"],
-      "enabled": true,
-      "description": "Clojure MCP server wrapping a Python scientific venv"
-    },
-    {
       "name": "shell",
       "transport": "stdio",
       "command": ["./bin/mcp_shell_server"],
       "enabled": true,
       "description": "Shell command execution server"
+    },
+    {
+      "name": "file",
+      "transport": "stdio",
+      "command": ["./bin/mcp_file_server"],
+      "enabled": true,
+      "description": "File management server"
+    },
+    {
+      "name": "directory",
+      "transport": "stdio",
+      "command": ["./bin/mcp_directory_server"],
+      "enabled": true,
+      "description": "Directory management server"
+    },
+    {
+      "name": "utility",
+      "transport": "stdio",
+      "command": ["./bin/mcp_utility_server"],
+      "enabled": true,
+      "description": "Utility tools server"
+    },
+    {
+      "name": "math",
+      "transport": "stdio",
+      "command": ["./bin/mcp_math_server"],
+      "enabled": true,
+      "description": "Mathematical and statistical tools server"
+    },
+    {
+      "name": "git",
+      "transport": "stdio",
+      "command": ["./bin/mcp_git_server"],
+      "enabled": true,
+      "description": "Git version control server"
+    },
+    {
+      "name": "time",
+      "transport": "stdio",
+      "command": ["./bin/mcp_time_server"],
+      "enabled": true,
+      "description": "Time and date utilities server"
+    },
+    {
+      "name": "system_info",
+      "transport": "stdio",
+      "command": ["./bin/mcp_system_info_server"],
+      "enabled": true,
+      "description": "System information and environment server"
+    },
+    {
+      "name": "memory",
+      "transport": "stdio",
+      "command": ["./bin/mcp_memory_server"],
+      "enabled": true,
+      "description": "Persistent long-term memory server"
+    },
+    {
+      "name": "web_fetch",
+      "transport": "stdio",
+      "command": ["./bin/mcp_web_fetch_server"],
+      "enabled": true,
+      "description": "Web fetching and research server"
     }
   ]
 }

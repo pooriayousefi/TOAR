@@ -2,12 +2,14 @@
 //  poorimcp.hpp — Async Model Context Protocol (Official Spec)
 //  Developed by: Pooria Yousefi
 //  License: Apache 2.0
-//
-//  Supports the two official MCP transports:
-//    1. STDIO  — subprocess + newline-delimited JSON-RPC over pipes
-//    2. HTTP   — Streamable HTTP (POST JSON-RPC to an HTTP endpoint)
 // ============================================================================
 #pragma once
+
+#include "asyncore.hpp"
+#include "io_thread_pool.hpp"
+#include "poorijson.hpp"
+#include "poorijsonrpc.hpp"
+#include "process.hpp"
 
 #include <string>
 #include <vector>
@@ -21,17 +23,22 @@
 #include <span>
 #include <system_error>
 #include <cstdint>
+#include <thread>
+#include <atomic>
 
-#include "asyncore.hpp"
-#include "io_thread_pool.hpp"
-#include "poorijson.hpp"
-#include "poorijsonrpc.hpp"
-#include "process.hpp"
-
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <arpa/inet.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  define NOMINMAX
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  pragma comment(lib, "ws2_32.lib")
+#else
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <unistd.h>
+#  include <arpa/inet.h>
+#  include <netdb.h>
+#endif
 
 namespace pooriayousefi::mcp
 {
@@ -41,15 +48,40 @@ namespace pooriayousefi::mcp
     using namespace process;
     using namespace rpc;
 
-    /// @brief Describes an MCP tool's metadata and schema.
+    namespace detail
+    {
+#ifdef _WIN32
+        struct WinsockInitializer
+        {
+            WinsockInitializer()
+            {
+                WSADATA data;
+                WSAStartup(MAKEWORD(2, 2), &data);
+            }
+            ~WinsockInitializer()
+            {
+                WSACleanup();
+            }
+            WinsockInitializer(const WinsockInitializer&) = delete;
+            WinsockInitializer& operator=(const WinsockInitializer&) = delete;
+        };
+        using socket_type = SOCKET;
+        constexpr socket_type invalid_socket = INVALID_SOCKET;
+        inline void close_socket(socket_type s) { closesocket(s); }
+#else
+        using socket_type = int;
+        constexpr socket_type invalid_socket = -1;
+        inline void close_socket(socket_type s) { ::close(s); }
+#endif
+    }
+
     struct MCPTool
     {
-        std::string name{};
-        std::string description{};
-        JSON parameters_schema{};
+        std::string name;
+        std::string description;
+        JSON parameters_schema;
     };
 
-    /// @brief Type-erased, move-only handler for MCP tool invocations.
     class ToolHandler
     {
         struct Base
@@ -62,31 +94,20 @@ namespace pooriayousefi::mcp
         struct Model : Base
         {
             F func;
-
-            explicit Model(F&& f) : func(std::move(f))
-            {
-            }
-
-            AsyncTask<JSON> invoke(const JSON& args) override
-            {
-                return func(args);
-            }
+            explicit Model(F&& f) : func(std::move(f)) {}
+            AsyncTask<JSON> invoke(const JSON& args) override { return func(args); }
         };
 
         std::unique_ptr<Base> impl_;
 
     public:
-        ToolHandler() = default;
-
+        ToolHandler() : impl_{nullptr} {}
         template <typename F>
             requires(!std::is_same_v<std::decay_t<F>, ToolHandler>)
-        ToolHandler(F&& f)
-            : impl_(std::make_unique<Model<std::decay_t<F>>>(std::forward<F>(f)))
-        {
-        }
+        ToolHandler(F&& f) : impl_{std::make_unique<Model<std::decay_t<F>>>(std::forward<F>(f))} {}
 
-        ToolHandler(ToolHandler&&) = default;
-        ToolHandler& operator=(ToolHandler&&) = default;
+        ToolHandler(ToolHandler&&) noexcept = default;
+        ToolHandler& operator=(ToolHandler&&) noexcept = default;
         ToolHandler(const ToolHandler&) = delete;
         ToolHandler& operator=(const ToolHandler&) = delete;
 
@@ -96,7 +117,6 @@ namespace pooriayousefi::mcp
             {
                 return impl_->invoke(args);
             }
-
             auto fallback = []() -> AsyncTask<JSON>
             {
                 JSON err;
@@ -107,237 +127,20 @@ namespace pooriayousefi::mcp
         }
     };
 
-    /// @brief Awaitable that suspends until a socket becomes readable/writable.
-    struct SocketAwaitable
-    {
-        NetworkReactor* reactor;
-        socket_t fd;
-        NetworkReactor::EventType type;
-
-        bool await_ready() noexcept
-        {
-            return false;
-        }
-
-        void await_suspend(std::coroutine_handle<> h)
-        {
-            reactor->register_socket(
-                fd,
-                type,
-                [h]()
-                {
-                    h.resume();
-                }
-            );
-        }
-
-        void await_resume() noexcept
-        {
-        }
-    };
-
-    // ----------------------------------------------------------------
-    //  AsyncHTTPClient — minimal HTTP/1.1 client for MCP HTTP transport
-    //  and LLM API calls.  Built directly on AsyncSocket.
-    // ----------------------------------------------------------------
-
-    class AsyncHTTPClient
-    {
-        std::string host_{};
-        int port_{80};
-        NetworkReactor* reactor_{nullptr};
-
-    public:
-        AsyncHTTPClient() = default;
-
-        AsyncHTTPClient(std::string host, int port)
-            : host_{std::move(host)}
-            , port_{port}
-            , reactor_{NetworkReactor::current}
-        {
-        }
-
-        AsyncTask<std::expected<std::string, std::error_code>>
-        post(std::string_view path, std::string_view body,
-             std::string_view content_type = "application/json")
-        {
-            std::expected<std::string, std::error_code> result{};
-
-            if (!reactor_)
-            {
-                result = std::unexpected(std::make_error_code(std::errc::operation_not_permitted));
-            }
-            else
-            {
-                AsyncSocket sock{reactor_};
-
-                auto connect_result = co_await sock.async_connect(host_, port_);
-                if (!connect_result)
-                {
-                    result = std::unexpected(connect_result.error());
-                }
-                else
-                {
-                    // Build the HTTP/1.1 request.
-                    std::string request;
-                    request.reserve(256 + body.size());
-                    request += "POST ";
-                    request += path;
-                    request += " HTTP/1.1\r\n";
-                    request += "Host: ";
-                    request += host_;
-                    request += "\r\n";
-                    request += "Content-Type: ";
-                    request += content_type;
-                    request += "\r\n";
-                    request += "Content-Length: ";
-                    request += std::to_string(body.size());
-                    request += "\r\n";
-                    request += "Connection: close\r\n\r\n";
-                    request += body;
-
-                    auto send_result = co_await sock.send(std::as_bytes(std::span{request}));
-                    if (!send_result)
-                    {
-                        result = std::unexpected(send_result.error());
-                    }
-                    else
-                    {
-                        // Read the full response.
-                        std::string raw;
-                        char chunk[4096];
-                        bool done = false;
-
-                        while (!done)
-                        {
-                            auto recv_result = co_await sock.recv(std::as_writable_bytes(std::span{chunk}));
-                            if (!recv_result || *recv_result == 0)
-                            {
-                                done = true;
-                            }
-                            else
-                            {
-                                raw.append(chunk, *recv_result);
-                            }
-                        }
-
-                        // Parse HTTP response: status line + headers + \r\n\r\n + body.
-                        auto header_end = raw.find("\r\n\r\n");
-                        if (header_end == std::string::npos)
-                        {
-                            result = std::unexpected(std::make_error_code(std::errc::bad_message));
-                        }
-                        else
-                        {
-                            result = raw.substr(header_end + 4);
-                        }
-                    }
-                }
-            }
-
-            co_return result;
-        }
-
-        AsyncTask<std::expected<std::string, std::error_code>>
-        get(std::string_view path)
-        {
-            std::expected<std::string, std::error_code> result{};
-
-            if (!reactor_)
-            {
-                result = std::unexpected(std::make_error_code(std::errc::operation_not_permitted));
-            }
-            else
-            {
-                AsyncSocket sock{reactor_};
-
-                auto connect_result = co_await sock.async_connect(host_, port_);
-                if (!connect_result)
-                {
-                    result = std::unexpected(connect_result.error());
-                }
-                else
-                {
-                    std::string request;
-                    request.reserve(256);
-                    request += "GET ";
-                    request += path;
-                    request += " HTTP/1.1\r\n";
-                    request += "Host: ";
-                    request += host_;
-                    request += "\r\n";
-                    request += "Connection: close\r\n\r\n";
-
-                    auto send_result = co_await sock.send(std::as_bytes(std::span{request}));
-                    if (!send_result)
-                    {
-                        result = std::unexpected(send_result.error());
-                    }
-                    else
-                    {
-                        std::string raw;
-                        char chunk[4096];
-                        bool done = false;
-
-                        while (!done)
-                        {
-                            auto recv_result = co_await sock.recv(std::as_writable_bytes(std::span{chunk}));
-                            if (!recv_result || *recv_result == 0)
-                            {
-                                done = true;
-                            }
-                            else
-                            {
-                                raw.append(chunk, *recv_result);
-                            }
-                        }
-
-                        auto header_end = raw.find("\r\n\r\n");
-                        if (header_end == std::string::npos)
-                        {
-                            result = std::unexpected(std::make_error_code(std::errc::bad_message));
-                        }
-                        else
-                        {
-                            result = raw.substr(header_end + 4);
-                        }
-                    }
-                }
-            }
-
-            co_return result;
-        }
-    };
-
-    // ----------------------------------------------------------------
-    //  MCPTransport — unified STDIO / HTTP transport layer
-    // ----------------------------------------------------------------
-
     class MCPTransport
     {
     public:
-        enum class Type
-        {
-            STDIO,
-            HTTP
-        };
-
+        enum class Type { STDIO, HTTP };
     private:
-        Type type_{Type::STDIO};
-        // STDIO fields
-        std::string executable_{};
-        std::vector<std::string> args_{};
-        std::unique_ptr<Process> process_{};
-        std::optional<AsyncPipe> pipe_{};
-        // HTTP fields
-        std::string host_{};
-        int port_{80};
-        std::string path_{"/mcp"};
-        std::optional<AsyncHTTPClient> http_client_{};
+        Type type_;
+        std::string executable_;
+        std::vector<std::string> args_;
+        std::string host_;
+        int port_;
+        std::string path_;
 
     public:
-        MCPTransport() = default;
-
+        MCPTransport() : type_{Type::STDIO}, port_{80}, path_{"/mcp"} {}
         MCPTransport(MCPTransport&&) noexcept = default;
         MCPTransport& operator=(MCPTransport&&) noexcept = default;
         MCPTransport(const MCPTransport&) = delete;
@@ -362,164 +165,34 @@ namespace pooriayousefi::mcp
             return t;
         }
 
-        AsyncTask<std::expected<void, std::error_code>> connect()
-        {
-            std::expected<void, std::error_code> result{};
-
-            if (type_ == Type::STDIO)
-            {
-                try
-                {
-                    process_ = std::make_unique<Process>();
-                    process_->start(executable_, args_);
-                    pipe_.emplace(NetworkReactor::current);
-                    pipe_->assign_write(process_->get_stdin_write());
-                    pipe_->assign_read(process_->get_stdout_read());
-                }
-                catch (const std::exception&)
-                {
-                    result = std::unexpected(std::make_error_code(std::errc::no_such_process));
-                }
-            }
-            else if (type_ == Type::HTTP)
-            {
-                http_client_.emplace(host_, port_);
-                result = {};
-            }
-
-            co_return result;
-        }
-
-        AsyncTask<std::expected<std::size_t, std::error_code>> send(std::span<const std::byte> buf)
-        {
-            std::expected<std::size_t, std::error_code> result{
-                std::unexpected(std::make_error_code(std::errc::operation_not_permitted))
-            };
-
-            if (type_ == Type::STDIO && pipe_)
-            {
-                result = co_await pipe_->send(buf);
-            }
-            else if (type_ == Type::HTTP && http_client_)
-            {
-                result = buf.size();
-            }
-
-            co_return result;
-        }
-
-        AsyncTask<std::expected<std::size_t, std::error_code>> recv(std::span<std::byte> buf)
-        {
-            std::expected<std::size_t, std::error_code> result{
-                std::unexpected(std::make_error_code(std::errc::operation_not_permitted))
-            };
-
-            if (type_ == Type::STDIO && pipe_)
-            {
-                result = co_await pipe_->recv(buf);
-            }
-            else if (type_ == Type::HTTP && http_client_)
-            {
-                result = 0;
-            }
-
-            co_return result;
-        }
-
-        // ----------------------------------------------------------------
-        //  HTTP-specific: send a JSON-RPC message and receive the response.
-        // ----------------------------------------------------------------
-
-        AsyncTask<std::expected<JSON, std::error_code>> send_http_rpc(const JSON& request)
-        {
-            std::expected<JSON, std::error_code> result{};
-
-            if (type_ != Type::HTTP || !http_client_)
-            {
-                result = std::unexpected(std::make_error_code(std::errc::operation_not_permitted));
-            }
-            else
-            {
-                std::string body = request.dump();
-                auto resp = co_await http_client_->post(path_, body);
-
-                if (!resp)
-                {
-                    result = std::unexpected(resp.error());
-                }
-                else
-                {
-                    auto parsed = parse(*resp);
-                    if (!parsed)
-                    {
-                        result = std::unexpected(std::make_error_code(std::errc::bad_message));
-                    }
-                    else
-                    {
-                        result = std::move(*parsed);
-                    }
-                }
-            }
-
-            co_return result;
-        }
-
-        [[nodiscard]] bool is_http() const noexcept
-        {
-            return type_ == Type::HTTP;
-        }
-
-        [[nodiscard]] bool is_stdio() const noexcept
-        {
-            return type_ == Type::STDIO;
-        }
+        [[nodiscard]] bool is_http() const noexcept { return type_ == Type::HTTP; }
+        [[nodiscard]] bool is_stdio() const noexcept { return type_ == Type::STDIO; }
+        [[nodiscard]] const std::string& get_executable() const noexcept { return executable_; }
+        [[nodiscard]] const std::vector<std::string>& get_args() const noexcept { return args_; }
+        [[nodiscard]] const std::string& get_host() const noexcept { return host_; }
+        [[nodiscard]] int get_port() const noexcept { return port_; }
+        [[nodiscard]] const std::string& get_path() const noexcept { return path_; }
     };
-
-    // ----------------------------------------------------------------
-    //  MCPServer — async MCP server (STDIO + HTTP)
-    // ----------------------------------------------------------------
 
     class MCPServer
     {
     public:
-        enum class Type
-        {
-            STDIO,
-            HTTP
-        };
-
-        using ToolMap = std::unordered_map<std::string, std::pair<MCPTool, ToolHandler>,
-                                           JSONStringHash, JSONStringEqual>;
+        enum class Type { STDIO, HTTP };
+        using ToolMap = std::unordered_map<std::string, std::pair<MCPTool, ToolHandler>, JSONStringHash, JSONStringEqual>;
 
     private:
-        Type type_{Type::STDIO};
-        int port_{-1};
-        ToolMap tools_{};
-        socket_t listen_fd_{INVALID_SOCK};
-        CancellationToken token_{};
+        Type type_;
+        int port_;
+        ToolMap tools_;
+        CancellationToken token_;
+#ifdef _WIN32
+        detail::WinsockInitializer winsock_init_;
+#endif
 
     public:
-        // STDIO mode — reads from stdin, writes to stdout.
-        MCPServer() : type_{Type::STDIO}
-        {
-        }
-
-        // HTTP mode — listens on a TCP port for HTTP POST requests.
-        explicit MCPServer(int port) : type_{Type::HTTP}, port_{port}
-        {
-        }
-
-        ~MCPServer()
-        {
-            stop();
-
-            if (listen_fd_ != INVALID_SOCK)
-            {
-                close_socket_impl(listen_fd_);
-                listen_fd_ = INVALID_SOCK;
-            }
-        }
-
+        MCPServer() : type_{Type::STDIO}, port_{-1} {}
+        explicit MCPServer(int port) : type_{Type::HTTP}, port_{port} {}
+        ~MCPServer() { stop(); }
         MCPServer(const MCPServer&) = delete;
         MCPServer& operator=(const MCPServer&) = delete;
         MCPServer(MCPServer&&) = delete;
@@ -531,45 +204,23 @@ namespace pooriayousefi::mcp
             tools_.try_emplace(std::move(name), std::move(tool), std::move(handler));
         }
 
-        void stop() noexcept
-        {
-            token_.cancel();
-        }
+        void stop() noexcept { token_.cancel(); }
 
         AsyncTask<void> start()
         {
-            if (type_ == Type::STDIO)
-            {
-                co_await start_stdio();
-            }
-            else
-            {
-                co_await start_http();
-            }
-
+            if (type_ == Type::STDIO) { co_await start_stdio(); }
+            else { co_await start_http(); }
             co_return;
         }
 
     private:
-        // ── STDIO mode: newline-delimited JSON-RPC over stdin/stdout ──
-
         AsyncTask<void> start_stdio()
         {
-            std::cout << "MCP Server (STDIO) running...\n";
-
             std::string line;
-
             while (!token_.is_cancelled() && std::getline(std::cin, line))
             {
-                if (!line.empty() && line.back() == '\r')
-                {
-                    line.pop_back();
-                }
-
-                if (line.empty())
-                {
-                    continue;
-                }
+                if (!line.empty() && line.back() == '\r') { line.pop_back(); }
+                if (line.empty()) { continue; }
 
                 auto parsed_req = parse(line);
                 if (parsed_req)
@@ -578,159 +229,90 @@ namespace pooriayousefi::mcp
                     std::cout << resp.dump() << "\n" << std::flush;
                 }
             }
-
             co_return;
         }
-
-        // ── HTTP mode: HTTP POST server on a TCP port ──
 
         AsyncTask<void> start_http()
         {
-            NetworkReactor* reactor = NetworkReactor::current;
+            detail::socket_type listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (listen_fd == detail::invalid_socket) { std::cerr << "Failed to create socket\n"; co_return; }
 
-            if (!reactor)
+            int opt = 1;
+            setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+
+            struct sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = INADDR_ANY;
+            address.sin_port = htons(static_cast<uint16_t>(port_));
+
+            if (::bind(listen_fd, reinterpret_cast<struct sockaddr*>(&address), sizeof(address)) < 0)
             {
-                std::cerr << "MCPServer started without a reactor context!\n"
-                          << "Call start() from inside ThreadPool::run().\n";
-            }
-            else
-            {
-                listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-                if (listen_fd_ == INVALID_SOCK)
-                {
-                    // Cannot create socket.
-                }
-                else
-                {
-                    int opt = 1;
-                    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR,
-                               reinterpret_cast<const char*>(&opt), sizeof(opt));
-                    set_nonblocking(listen_fd_);
-
-                    struct sockaddr_in address{};
-                    address.sin_family = AF_INET;
-                    address.sin_addr.s_addr = INADDR_ANY;
-                    address.sin_port = htons(static_cast<uint16_t>(port_));
-
-                    if (bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&address),
-                             sizeof(address)) < 0)
-                    {
-                        std::cerr << "Failed to bind to port " << port_ << "\n";
-                    }
-                    else if (listen(listen_fd_, 3) < 0)
-                    {
-                        std::cerr << "Failed to listen on socket\n";
-                    }
-                    else
-                    {
-                        std::cout << "MCP Server (HTTP) listening on port "
-                                  << port_ << "...\n";
-
-                        while (!token_.is_cancelled())
-                        {
-                            struct sockaddr_in client_addr{};
-                            socklen_t addrlen = sizeof(client_addr);
-
-                            socket_t client_fd = accept(listen_fd_,
-                                reinterpret_cast<struct sockaddr*>(&client_addr), &addrlen);
-
-                            if (client_fd == INVALID_SOCK)
-                            {
-                                co_await SocketAwaitable{
-                                    reactor, listen_fd_,
-                                    NetworkReactor::EventType::READABLE
-                                };
-                                continue;
-                            }
-
-                            auto handler = [this, client_fd]() -> DetachedTask
-                            {
-                                co_await handle_client(client_fd);
-                                co_return;
-                            };
-
-                            auto dt = handler();
-                            auto h = dt.handle;
-                            dt.detach();
-                            h.resume();
-                        }
-                    }
-
-                    close_socket_impl(listen_fd_);
-                    listen_fd_ = INVALID_SOCK;
-                }
+                std::cerr << "Failed to bind to port " << port_ << "\n";
+                detail::close_socket(listen_fd);
+                co_return;
             }
 
+            if (::listen(listen_fd, 3) < 0)
+            {
+                std::cerr << "Failed to listen on socket\n";
+                detail::close_socket(listen_fd);
+                co_return;
+            }
+
+            std::cout << "MCP Server (HTTP) listening on port " << port_ << "...\n";
+
+            while (!token_.is_cancelled())
+            {
+                struct sockaddr_in client_addr{};
+                socklen_t addrlen = sizeof(client_addr);
+                detail::socket_type client_fd = ::accept(listen_fd, reinterpret_cast<struct sockaddr*>(&client_addr), &addrlen);
+
+                if (client_fd == detail::invalid_socket) { continue; }
+
+                std::thread([this, client_fd]() -> void {
+                    handle_http_client_blocking(client_fd);
+                }).detach();
+            }
+
+            detail::close_socket(listen_fd);
             co_return;
         }
 
-        AsyncTask<void> handle_client(socket_t client_fd)
+        void handle_http_client_blocking(detail::socket_type client_fd)
         {
-            AsyncSocket sock;
-            sock.assign(client_fd);
-
             std::string buffer;
             char chunk[4096];
             bool request_complete = false;
 
             while (!request_complete)
             {
-                auto recv_result = co_await sock.recv(std::as_writable_bytes(std::span{chunk}));
-
-                if (!recv_result || *recv_result == 0)
-                {
-                    request_complete = true;
-                }
+                int n = ::recv(client_fd, chunk, sizeof(chunk), 0);
+                if (n <= 0) { request_complete = true; }
                 else
                 {
-                    buffer.append(chunk, *recv_result);
-
+                    buffer.append(chunk, n);
                     auto header_end = buffer.find("\r\n\r\n");
-
                     if (header_end != std::string::npos)
                     {
                         std::string_view headers{buffer.data(), header_end};
                         auto cl_pos = headers.find("Content-Length:");
-                        if (cl_pos == std::string_view::npos)
-                        {
-                            cl_pos = headers.find("content-length:");
-                        }
+                        if (cl_pos == std::string_view::npos) { cl_pos = headers.find("content-length:"); }
 
                         if (cl_pos != std::string_view::npos)
                         {
                             std::size_t value_start = cl_pos + 16;
-                            while (value_start < headers.size() &&
-                                   (headers[value_start] == ' ' || headers[value_start] == '\t'))
-                            {
-                                value_start++;
-                            }
+                            while (value_start < headers.size() && (headers[value_start] == ' ' || headers[value_start] == '\t')) { value_start++; }
                             auto line_end = headers.find("\r\n", cl_pos);
-                            if (line_end == std::string_view::npos)
-                            {
-                                line_end = headers.size();
-                            }
+                            if (line_end == std::string_view::npos) { line_end = headers.size(); }
+                            
                             std::string cl_str{headers.substr(value_start, line_end - value_start)};
-
                             std::size_t content_length = 0;
-                            for (char c : cl_str)
-                            {
-                                if (c >= '0' && c <= '9')
-                                {
-                                    content_length = content_length * 10 + (c - '0');
-                                }
-                            }
+                            for (char c : cl_str) { if (c >= '0' && c <= '9') { content_length = content_length * 10 + (c - '0'); } }
 
                             std::size_t body_start = header_end + 4;
-
-                            if (buffer.size() >= body_start + content_length)
-                            {
-                                request_complete = true;
-                            }
+                            if (buffer.size() >= body_start + content_length) { request_complete = true; }
                         }
-                        else
-                        {
-                            request_complete = true;
-                        }
+                        else { request_complete = true; }
                     }
                 }
             }
@@ -739,63 +321,46 @@ namespace pooriayousefi::mcp
             if (header_end != std::string::npos)
             {
                 std::string_view json_sv{buffer.data() + header_end + 4};
-
                 auto parsed_req = parse(json_sv);
                 if (parsed_req)
                 {
-                    JSON resp = co_await handle_rpc(*parsed_req);
+                    JSON resp = sync_wait(handle_rpc(*parsed_req));
                     std::string body = resp.dump();
 
                     std::string http_resp;
                     http_resp += "HTTP/1.1 200 OK\r\n";
                     http_resp += "Content-Type: application/json\r\n";
-                    http_resp += "Content-Length: ";
-                    http_resp += std::to_string(body.size());
-                    http_resp += "\r\n";
+                    http_resp += "Content-Length: " + std::to_string(body.size()) + "\r\n";
                     http_resp += "Connection: close\r\n\r\n";
                     http_resp += body;
 
-                    co_await sock.send(std::as_bytes(std::span{http_resp}));
+                    ::send(client_fd, http_resp.data(), static_cast<int>(http_resp.size()), 0);
                 }
             }
-
-            sock.close();
-            co_return;
+            detail::close_socket(client_fd);
         }
 
         AsyncTask<JSON> handle_rpc(const JSON& req)
         {
             JSON resp{};
-
             if (!req.contains("id"))
             {
-                resp = make_error(ErrorCode::INVALID_REQUEST,
-                                  "Invalid Request: missing id", JSON(nullptr));
+                resp = make_error(ErrorCode::INVALID_REQUEST, "Invalid Request: missing id", JSON(nullptr));
             }
             else
             {
                 if (!req.contains("method"))
                 {
-                    resp = make_error(ErrorCode::INVALID_REQUEST,
-                                      "Missing method", req["id"]);
+                    resp = make_error(ErrorCode::INVALID_REQUEST, "Missing method", req["id"]);
                 }
                 else
                 {
                     std::string method = req["method"].get_string();
-
                     if (method == "initialize")
                     {
-                        JSON server_info;
-                        server_info["name"] = "poorimcp-server";
-                        server_info["version"] = "1.0.0";
-
-                        JSON caps;
-                        caps["tools"] = JSONObject{};
-
-                        JSON result_obj;
-                        result_obj["protocolVersion"] = "2026-07-24";
-                        result_obj["serverInfo"] = server_info;
-                        result_obj["capabilities"] = caps;
+                        JSON server_info; server_info["name"] = "poorimcp-server"; server_info["version"] = "1.0.0";
+                        JSON caps; caps["tools"] = JSONObject{};
+                        JSON result_obj; result_obj["protocolVersion"] = "2026-07-24"; result_obj["serverInfo"] = server_info; result_obj["capabilities"] = caps;
                         resp = make_response(std::move(result_obj), req["id"]);
                     }
                     else if (method == "tools/list")
@@ -809,82 +374,78 @@ namespace pooriayousefi::mcp
                             tool_json["inputSchema"] = pair.first.parameters_schema;
                             tools_arr.push_back(tool_json);
                         }
-
-                        JSON result_obj;
-                        result_obj["tools"] = std::move(tools_arr);
+                        JSON result_obj; result_obj["tools"] = std::move(tools_arr);
                         resp = make_response(std::move(result_obj), req["id"]);
                     }
                     else if (method == "tools/call")
                     {
                         if (!req.contains("params") || !req["params"].contains("name"))
                         {
-                            resp = make_error(ErrorCode::INVALID_PARAMS,
-                                              "Missing tool name", req["id"]);
+                            resp = make_error(ErrorCode::INVALID_PARAMS, "Missing tool name", req["id"]);
                         }
                         else
                         {
                             std::string tool_name = req["params"]["name"].get_string();
-                            JSON args = req["params"].contains("arguments")
-                                          ? req["params"]["arguments"]
-                                          : JSON(nullptr);
+                            JSON args = req["params"].contains("arguments") ? req["params"]["arguments"] : JSON(nullptr);
 
                             auto it = tools_.find(tool_name);
                             if (it == tools_.end())
                             {
-                                resp = make_error(ErrorCode::METHOD_NOT_FOUND,
-                                                  "Tool not found", req["id"]);
+                                resp = make_error(ErrorCode::METHOD_NOT_FOUND, "Tool not found", req["id"]);
                             }
                             else
                             {
                                 try
                                 {
                                     JSON tool_result = co_await it->second.second(args);
-
-                                    JSON text_content;
-                                    text_content["type"] = "text";
-                                    text_content["text"] = tool_result.dump();
-
-                                    JSONArray content_arr;
-                                    content_arr.push_back(text_content);
-
-                                    JSON result_obj;
-                                    result_obj["content"] = std::move(content_arr);
+                                    JSON text_content; text_content["type"] = "text"; text_content["text"] = tool_result.dump();
+                                    JSONArray content_arr; content_arr.push_back(text_content);
+                                    JSON result_obj; result_obj["content"] = std::move(content_arr);
                                     resp = make_response(std::move(result_obj), req["id"]);
                                 }
                                 catch (const std::exception& e)
                                 {
-                                    resp = make_error(ErrorCode::INTERNAL_ERROR,
-                                                      e.what(), req["id"]);
+                                    resp = make_error(ErrorCode::INTERNAL_ERROR, e.what(), req["id"]);
                                 }
                             }
                         }
                     }
                     else
                     {
-                        resp = make_error(ErrorCode::METHOD_NOT_FOUND,
-                                          "Method not found", req["id"]);
+                        resp = make_error(ErrorCode::METHOD_NOT_FOUND, "Method not found", req["id"]);
                     }
                 }
             }
-
             co_return resp;
         }
     };
 
-    // ----------------------------------------------------------------
-    //  MCPClient — async MCP client (stdio + HTTP transports)
-    // ----------------------------------------------------------------
-
     class MCPClient
     {
-        MCPTransport transport_{};
-        int request_id_{0};
-        std::vector<MCPTool> discovered_tools_{};
+        MCPTransport transport_;
+        std::reference_wrapper<ThreadPool> pool_;
+        int request_id_;
+        std::vector<MCPTool> discovered_tools_;
+        std::unique_ptr<Process> process_;
+#ifdef _WIN32
+        detail::WinsockInitializer winsock_init_;
+#endif
 
     public:
-        explicit MCPClient(MCPTransport transport)
-            : transport_{std::move(transport)}
+        MCPClient(MCPTransport transport, std::reference_wrapper<ThreadPool> pool)
+            : transport_{std::move(transport)}, pool_{pool}, request_id_{0}, process_{nullptr}
+#ifdef _WIN32
+            , winsock_init_{}
+#endif
+        {}
+
+        ~MCPClient()
         {
+            if (process_)
+            {
+                process_->close_stdin();
+                process_->terminate();
+            }
         }
 
         MCPClient(const MCPClient&) = delete;
@@ -894,14 +455,34 @@ namespace pooriayousefi::mcp
 
         AsyncTask<std::expected<void, std::error_code>> connect_async()
         {
-            auto result = co_await transport_.connect();
+            std::expected<void, std::error_code> result{};
+            try
+            {
+                if (transport_.is_stdio())
+                {
+                    process_ = std::make_unique<Process>();
+                    process_->start(transport_.get_executable(), transport_.get_args());
+                    result = {};
+                }
+                else if (transport_.is_http())
+                {
+                    result = {};
+                }
+                else
+                {
+                    result = std::unexpected(std::make_error_code(std::errc::not_supported));
+                }
+            }
+            catch (const std::exception&)
+            {
+                result = std::unexpected(std::make_error_code(std::errc::no_such_process));
+            }
             co_return result;
         }
 
         AsyncTask<std::expected<void, std::string>> initialize()
         {
             std::expected<void, std::string> result{};
-
             JSON init_params;
             init_params["protocolVersion"] = "2026-07-24";
             init_params["capabilities"] = JSONObject{};
@@ -938,22 +519,14 @@ namespace pooriayousefi::mcp
                     result = {};
                 }
             }
-
             co_return result;
         }
 
-        [[nodiscard]] const std::vector<MCPTool>& get_tools() const noexcept
-        {
-            return discovered_tools_;
-        }
+        [[nodiscard]] const std::vector<MCPTool>& get_tools() const noexcept { return discovered_tools_; }
 
-        AsyncTask<std::expected<std::string, std::string>> call_tool_async(
-            const std::string& tool_name,
-            const JSON& args
-        )
+        AsyncTask<std::expected<std::string, std::string>> call_tool_async(const std::string& tool_name, const JSON& args)
         {
             std::expected<std::string, std::string> result{};
-
             JSON call_params;
             call_params["name"] = tool_name;
             call_params["arguments"] = args;
@@ -983,7 +556,6 @@ namespace pooriayousefi::mcp
                     result = resp->dump();
                 }
             }
-
             co_return result;
         }
 
@@ -991,89 +563,257 @@ namespace pooriayousefi::mcp
         AsyncTask<std::expected<JSON, std::string>> send_rpc_async(const JSON& request)
         {
             std::expected<JSON, std::string> result{};
-
             if (transport_.is_http())
             {
-                // HTTP transport — POST the request and get the response.
-                auto http_result = co_await transport_.send_http_rpc(request);
-                if (!http_result)
+                std::string body = request.dump();
+                auto http_res = co_await pool_.get().run_blocking(
+                    [this, &body]() -> std::expected<std::string, std::error_code> { return send_http_blocking(body); }
+                );
+
+                if (!http_res)
                 {
-                    result = std::unexpected(http_result.error().message());
-                }
-                else if (http_result->contains("error") &&
-                         (*http_result)["error"].contains("message"))
-                {
-                    result = std::unexpected((*http_result)["error"]["message"].get_string());
+                    result = std::unexpected(http_res.error().message());
                 }
                 else
                 {
-                    result = (*http_result)["result"];
+                    auto parsed = parse(*http_res);
+                    if (!parsed) { result = std::unexpected("Invalid JSON from HTTP server"); }
+                    else if (parsed->contains("error") && (*parsed)["error"].contains("message")) { result = std::unexpected((*parsed)["error"]["message"].get_string()); }
+                    else { result = (*parsed)["result"]; }
+                }
+            }
+            else if (transport_.is_stdio())
+            {
+                if (!process_)
+                {
+                    result = std::unexpected("Process is not initialized");
+                }
+                else
+                {
+                    std::string req_str = request.dump() + "\n";
+                    auto send_res = co_await pool_.get().run_blocking(
+                        [this, &req_str]() -> std::expected<std::size_t, std::error_code> { return process_->write_stdin(std::as_bytes(std::span{req_str})); }
+                    );
+
+                    if (!send_res)
+                    {
+                        result = std::unexpected("Failed to send RPC request to subprocess");
+                    }
+                    else
+                    {
+                        auto recv_res = co_await pool_.get().run_blocking(
+                            [this]() -> std::expected<std::string, std::error_code>
+                            {
+                                std::string buf;
+                                char chunk[4096];
+                                bool done = false;
+                                while (!done)
+                                {
+                                    auto r = process_->read_stdout(std::as_writable_bytes(std::span{chunk}));
+                                    if (!r) { return std::unexpected(r.error()); }
+                                    if (*r == 0) { done = true; }
+                                    else
+                                    {
+                                        buf.append(chunk, *r);
+                                        if (buf.find('\n') != std::string::npos) { done = true; }
+                                    }
+                                }
+                                return buf;
+                            }
+                        );
+
+                        if (!recv_res)
+                        {
+                            result = std::unexpected("Failed to read RPC response from subprocess");
+                        }
+                        else
+                        {
+                            std::string& buffer = *recv_res;
+                            if (buffer.empty())
+                            {
+                                result = std::unexpected("MCP process closed connection (no response)");
+                            }
+                            else
+                            {
+                                auto newline_pos = buffer.find('\n');
+                                std::string_view json_sv{};
+                                if (newline_pos != std::string::npos) { json_sv = std::string_view{buffer.data(), newline_pos}; }
+                                else { json_sv = std::string_view{buffer.data(), buffer.size()}; }
+
+                                if (!json_sv.empty() && json_sv.back() == '\r') { json_sv.remove_suffix(1); }
+
+                                auto parsed = parse(json_sv);
+                                if (!parsed) { result = std::unexpected("Invalid JSON from MCP Server"); }
+                                else if (parsed->contains("error") && (*parsed)["error"].contains("message")) { result = std::unexpected((*parsed)["error"]["message"].get_string()); }
+                                else { result = (*parsed)["result"]; }
+                            }
+                        }
+                    }
                 }
             }
             else
             {
-                // STDIO transport — newline-delimited JSON-RPC.
-                std::string req_str = request.dump() + "\n";
-                auto send_res = co_await transport_.send(std::as_bytes(std::span{req_str}));
-                if (!send_res)
+                result = std::unexpected("Unsupported transport");
+            }
+            co_return result;
+        }
+
+        std::expected<std::string, std::error_code> send_http_blocking(const std::string& body)
+        {
+            std::expected<std::string, std::error_code> result{};
+            struct addrinfo hints{};
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            struct addrinfo* addr_result = nullptr;
+
+            if (getaddrinfo(transport_.get_host().c_str(), std::to_string(transport_.get_port()).c_str(), &hints, &addr_result) != 0 || !addr_result)
+            {
+                result = std::unexpected(std::make_error_code(std::errc::address_not_available));
+            }
+            else
+            {
+                auto deleter = [](addrinfo* p) { if (p) { freeaddrinfo(p); } };
+                std::unique_ptr<addrinfo, decltype(deleter)> addr_guard(addr_result, deleter);
+
+                detail::socket_type sock = -1;
+                for (struct addrinfo* rp = addr_result; rp != nullptr; rp = rp->ai_next)
                 {
-                    result = std::unexpected("Failed to send RPC request");
+                    sock = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+                    if (sock == detail::invalid_socket) { continue; }
+
+                    if (::connect(sock, rp->ai_addr, static_cast<int>(rp->ai_addrlen)) == 0)
+                    {
+                        break; // Success
+                    }
+
+                    detail::close_socket(sock);
+                    sock = -1;
+                }
+
+                if (sock < 0)
+                {
+                    result = std::unexpected(std::make_error_code(std::errc::connection_refused));
                 }
                 else
                 {
-                    std::string buffer;
-                    char chunk[4096];
-                    bool done = false;
+                    std::string request;
+                    request.reserve(256 + body.size());
+                    request += "POST ";
+                    request += transport_.get_path();
+                    request += " HTTP/1.1\r\nHost: ";
+                    request += transport_.get_host();
+                    request += "\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: ";
+                    request += std::to_string(body.size());
+                    request += "\r\nConnection: close\r\n\r\n";
+                    request += body;
 
-                    while (!done)
+                    std::size_t total_sent = 0;
+                    bool send_error = false;
+                    while (total_sent < request.size())
                     {
-                        auto recv_res = co_await transport_.recv(std::as_writable_bytes(std::span{chunk}));
-                        if (!recv_res || *recv_res == 0)
-                        {
-                            done = true;
-                        }
-                        else
-                        {
-                            buffer.append(chunk, *recv_res);
-                            if (buffer.find('\n') != std::string::npos)
-                            {
-                                done = true;
-                            }
-                        }
+                        int n = ::send(sock, request.data() + total_sent, static_cast<int>(request.size() - total_sent), 0);
+                        if (n <= 0) { send_error = true; break; }
+                        total_sent += n;
                     }
 
-                    auto newline_pos = buffer.find('\n');
-                    if (newline_pos == std::string::npos)
+                    if (send_error)
                     {
-                        result = std::unexpected("No newline in response");
+                        detail::close_socket(sock);
+                        result = std::unexpected(std::make_error_code(std::errc::broken_pipe));
                     }
                     else
                     {
-                        std::string_view json_sv{buffer.data(), newline_pos};
-                        if (!json_sv.empty() && json_sv.back() == '\r')
+                        std::string raw;
+                        char chunk[4096];
+                        bool is_sse = false;
+                        bool headers_parsed = false;
+                        std::string body_accumulator;
+
+                        while (true)
                         {
-                            json_sv.remove_suffix(1);
+                            int n = ::recv(sock, chunk, sizeof(chunk), 0);
+                            if (n < 0) { break; } // Error
+                            if (n == 0) { break; } // EOF
+
+                            raw.append(chunk, n);
+
+                            if (!headers_parsed)
+                            {
+                                auto header_end = raw.find("\r\n\r\n");
+                                if (header_end != std::string::npos)
+                                {
+                                    headers_parsed = true;
+                                    std::string headers = raw.substr(0, header_end);
+                                    if (headers.find("text/event-stream") != std::string::npos)
+                                    {
+                                        is_sse = true;
+                                    }
+                                    body_accumulator = raw.substr(header_end + 4);
+                                }
+                            }
+                            else
+                            {
+                                body_accumulator.append(chunk, n);
+                            }
+
+                            if (is_sse && headers_parsed)
+                            {
+                                // Parse SSE stream to find the JSON-RPC response
+                                std::size_t data_pos = body_accumulator.find("data: ");
+                                while (data_pos != std::string::npos)
+                                {
+                                    std::size_t line_end = body_accumulator.find("\n", data_pos);
+                                    if (line_end == std::string::npos) { break; } // Incomplete line, wait for more data
+
+                                    std::string data_str = body_accumulator.substr(data_pos + 6, line_end - (data_pos + 6));
+                                    if (!data_str.empty() && data_str.back() == '\r') { data_str.pop_back(); }
+
+                                    if (!data_str.empty())
+                                    {
+                                        auto parsed = parse(data_str);
+                                        if (parsed && (parsed->contains("jsonrpc") || parsed->contains("result") || parsed->contains("error")))
+                                        {
+                                            detail::close_socket(sock);
+                                            return data_str; // Found the MCP JSON-RPC response!
+                                        }
+                                    }
+                                    body_accumulator.erase(0, line_end + 1);
+                                    data_pos = body_accumulator.find("data: ");
+                                }
+                            }
                         }
 
-                        auto parsed = parse(json_sv);
-                        if (!parsed)
+                        detail::close_socket(sock);
+
+                        if (!headers_parsed)
                         {
-                            result = std::unexpected("Invalid JSON from MCP Server");
+                            result = std::unexpected(std::make_error_code(std::errc::bad_message));
                         }
-                        else if (parsed->contains("error") &&
-                                 (*parsed)["error"].contains("message"))
+                        else if (is_sse)
                         {
-                            result = std::unexpected((*parsed)["error"]["message"].get_string());
+                            result = std::unexpected(std::make_error_code(std::errc::bad_message)); // Didn't find JSON-RPC in SSE
                         }
                         else
                         {
-                            result = (*parsed)["result"];
+                            auto header_end = raw.find("\r\n\r\n");
+                            if (header_end == std::string::npos) { result = std::unexpected(std::make_error_code(std::errc::bad_message)); }
+                            else
+                            {
+                                std::string status_line = raw.substr(0, raw.find("\r\n"));
+                                if (status_line.find("200 OK") == std::string::npos)
+                                {
+                                    result = std::unexpected(std::make_error_code(std::errc::bad_message));
+                                }
+                                else
+                                {
+                                    result = raw.substr(header_end + 4);
+                                }
+                            }
                         }
                     }
                 }
             }
-
-            co_return result;
+            return result;
         }
     };
 }

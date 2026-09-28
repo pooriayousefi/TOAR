@@ -38,27 +38,36 @@ void print_banner()
 
 int main(int argc, char* argv[])
 {
-    auto exit_code{0};
+    int exit_code{EXIT_FAILURE};
 
-    try
+    // Rule #6: Use a lambda to enforce a single return point in main.
+    auto run = [&]() -> void
     {
         print_banner();
 
         // ── Parse CLI arguments ─────────────────────────────────────
         if (argc < 4)
         {
-            std::println("  Usage: ./toar <llm_url> <model_name> <temperature>");
+            std::println("  Usage: ./toar <llm_url> <model_name> <temperature> [api_key]");
             std::println("  Example: ./toar http://localhost:8080 gpt-oss-20b 0.7");
+            std::println("  Example: ./toar https://api.openai.com gpt-4o 0.7 sk-...");
             std::println("");
             std::println("  Then type messages and press Enter.");
             std::println("  Commands: /quit  /clear  /tools  /history");
             std::println("");
-            return EXIT_FAILURE;
+            exit_code = EXIT_FAILURE;
+            return;
         }
 
         std::string llm_url_str = argv[1];
         std::string model_name = argv[2];
         std::string temp_str = argv[3];
+        std::string api_key{};
+
+        if (argc > 4)
+        {
+            api_key = argv[4];
+        }
 
         // Parse temperature.
         double temperature = 0.7;
@@ -71,34 +80,14 @@ int main(int argc, char* argv[])
             std::println("  Error: Invalid temperature '{}'. Using default 0.7.", temp_str);
         }
 
-        // Parse LLM URL (http://host:port).
-        std::string llm_host = "127.0.0.1";
-        int llm_port = 8080;
-
-        if (llm_url_str.starts_with("http://"))
-        {
-            llm_url_str = llm_url_str.substr(7);
-        }
-
-        auto colon_pos = llm_url_str.find(':');
-        if (colon_pos != std::string::npos)
-        {
-            llm_host = llm_url_str.substr(0, colon_pos);
-            llm_port = std::stoi(llm_url_str.substr(colon_pos + 1));
-        }
-        else
-        {
-            llm_host = llm_url_str;
-        }
-
         // ── Configuration ──────────────────────────────────────────
         AgentConfig config;
         config.id = "toar-agent";
         config.llm_model_name = model_name;
-        config.llm_host = llm_host;
-        config.llm_port = llm_port;
+        config.llm_base_url = llm_url_str; // httplib parses the URL natively
+        config.llm_api_key = api_key;
         config.system_prompt =
-            "You are TOAR, an autonomous agentic runtime.\n"
+            "You are TOAR, an autonomous tool-oriented agentic runtime.\n"
             "You have access to external tools via the Model Context Protocol.\n"
             "When you need information or want to perform an action, call a tool.\n"
             "When you have the answer, respond with text (no tool call).\n"
@@ -106,11 +95,12 @@ int main(int argc, char* argv[])
 
         config.mcp_config_file = "tool_servers.json";
         config.temperature = temperature;
-        config.max_cycles = 15;
+        config.max_cycles = 30;
 
         std::println("  Agent ID    : {}", config.id);
         std::println("  LLM Model   : {}", config.llm_model_name);
-        std::println("  LLM Server  : {}:{}", config.llm_host, config.llm_port);
+        std::println("  LLM URL     : {}", config.llm_base_url);
+        std::println("  API Key     : {}", config.llm_api_key.empty() ? "(none)" : "****");
         std::println("  MCP Config  : {}", config.mcp_config_file);
         std::println("  Max Cycles  : {}", config.max_cycles);
         std::println("  Temperature : {}", config.temperature);
@@ -120,7 +110,7 @@ int main(int argc, char* argv[])
         ThreadPool pool{4};
 
         // ── Create Agent ───────────────────────────────────────────
-        Agent agent{std::move(config)};
+        Agent agent{pool, std::move(config)};
 
         // ── Setup: Connect to MCP servers, discover tools ─────────
         std::println("\n  Connecting to MCP servers...");
@@ -158,7 +148,7 @@ int main(int argc, char* argv[])
         while (true)
         {
             std::print("\n  You> ");
-            std::fflush(stdout);
+            std::cout << std::flush;
 
             if (!std::getline(std::cin, user_input) || user_input == "/quit")
             {
@@ -220,6 +210,11 @@ int main(int argc, char* argv[])
         }
 
         exit_code = EXIT_SUCCESS;
+    };
+
+    try
+    {
+        run();
     }
     catch (const std::exception& xxx)
     {
@@ -227,7 +222,7 @@ int main(int argc, char* argv[])
         for (auto i : std::ranges::views::iota(1, 6))
         {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            std::cout << (6 - i) << ' ';
+            std::cout << (6 - i) << ' ' << std::flush;
         }
         std::cout << std::endl;
         exit_code = EXIT_FAILURE;

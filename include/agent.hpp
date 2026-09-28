@@ -11,25 +11,42 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <format>
+#include <functional>
 
 #include "llm.hpp"
+#include "poorimcp.hpp"
 
 namespace pooriayousefi::toar
 {
     using namespace core;
     using namespace mcp;
+    using namespace io_bound;
+    using namespace json;
 
     /// @brief Configuration for constructing an Agent.
     struct AgentConfig
     {
-        ID id{};
-        std::string llm_model_name{};
-        std::string llm_host{};
-        int llm_port{8080};
-        std::string system_prompt{};
-        std::string mcp_config_file{"tool_servers.json"};
-        double temperature{0.7};
-        int max_cycles{10};
+        ID id;
+        std::string llm_model_name;
+        std::string llm_base_url;
+        std::string llm_api_key;
+        std::string system_prompt;
+        std::string mcp_config_file;
+        double temperature;
+        int max_cycles;
+
+        AgentConfig()
+            : id{}
+            , llm_model_name{}
+            , llm_base_url{"http://localhost:8080"}
+            , llm_api_key{}
+            , system_prompt{}
+            , mcp_config_file{"tool_servers.json"}
+            , temperature{0.7}
+            , max_cycles{30}
+        {
+        }
     };
 
     /// @brief The agentic AI runtime.
@@ -43,25 +60,39 @@ namespace pooriayousefi::toar
     class Agent
     {
     public:
-        using ToolMap = std::unordered_map<std::string, std::size_t,
-                                           JSONStringHash, JSONStringEqual>;
+        using ToolMap = std::unordered_map<std::string, std::size_t, JSONStringHash, JSONStringEqual>;
+        using SchemaMap = std::unordered_map<std::string, JSON, JSONStringHash, JSONStringEqual>;
 
     private:
+        std::reference_wrapper<ThreadPool> pool_;
         ID id_;
         AgentConfig config_;
         AsyncLLMClient llm_client_;
-        std::vector<MCPClient> mcp_clients_{};
-        std::vector<MCPTool> discovered_tools_{};
+        std::vector<MCPClient> mcp_clients_;
+        std::vector<MCPTool> discovered_tools_;
         Logger logger_;
         JSON history_;
-        ToolMap tool_map_{};
+        ToolMap tool_map_;
+        SchemaMap tool_schemas_; // Added to validate required arguments
 
     public:
-        explicit Agent(AgentConfig config)
-            : id_{config.id}
+        explicit Agent(std::reference_wrapper<ThreadPool> pool, AgentConfig config)
+            : pool_{pool}
+            , id_{config.id}
             , config_{std::move(config)}
-            , llm_client_{config_.llm_model_name, config_.llm_host, config_.llm_port}
+            , llm_client_{
+                pool_.get(),
+                config_.llm_model_name,
+                config_.llm_base_url,
+                "/v1/chat/completions",
+                config_.llm_api_key
+              }
+            , mcp_clients_{}
+            , discovered_tools_{}
             , logger_{id_}
+            , history_{} // FIX: prevents initialization as [[]]
+            , tool_map_{}
+            , tool_schemas_{}
         {
             logger_.open_stream();
         }
@@ -77,12 +108,6 @@ namespace pooriayousefi::toar
         //  Setup: connect to MCP servers and discover tools
         // ----------------------------------------------------------------
 
-        /// @brief Reads the config file, connects to each enabled MCP server,
-        ///        and discovers available tools.
-        ///
-        /// Must be called before reason_act_loop() or chat().
-        /// Must be called from inside a coroutine running on a ThreadPool
-        /// (NetworkReactor::current must be set).
         [[nodiscard]] AsyncTask<std::expected<void, std::string>> setup()
         {
             std::expected<void, std::string> result{};
@@ -167,7 +192,7 @@ namespace pooriayousefi::toar
                         continue;
                     }
 
-                    MCPClient client{std::move(transport)};
+                    MCPClient client{std::move(transport), pool_};
 
                     auto connect_result = co_await client.connect_async();
                     if (!connect_result)
@@ -199,6 +224,9 @@ namespace pooriayousefi::toar
                         ));
                         discovered_tools_.push_back(tool);
                         tool_map_[tool.name] = client_index;
+                        
+                        // Store the schema for lightweight validation later
+                        tool_schemas_[tool.name] = tool.parameters_schema;
                     }
 
                     mcp_clients_.push_back(std::move(client));
@@ -230,8 +258,6 @@ namespace pooriayousefi::toar
         //  Tool schema building (OpenAI function-calling format)
         // ----------------------------------------------------------------
 
-        /// @brief Builds an OpenAI-compatible tools schema array from
-        ///        discovered MCP tools.
         [[nodiscard]] JSON build_tools_schema() const
         {
             JSON schema = JSONArray{};
@@ -262,11 +288,6 @@ namespace pooriayousefi::toar
         //  Tool dispatch
         // ----------------------------------------------------------------
 
-        /// @brief Routes a tool call to the appropriate MCPClient.
-        ///
-        /// @param tool_name  the name of the tool to call.
-        /// @param args       the JSON arguments for the tool.
-        /// @return the tool's text result, or an error string.
         [[nodiscard]] AsyncTask<std::expected<std::string, std::string>>
         dispatch_tool(const std::string& tool_name, const JSON& args)
         {
@@ -312,16 +333,6 @@ namespace pooriayousefi::toar
         //  ReAct loop (core engine)
         // ----------------------------------------------------------------
 
-        /// @brief The ReAct loop: Reason → Act → Tool Call → Loop.
-        ///
-        /// Sends the conversation to the LLM. If the LLM requests tool calls,
-        /// dispatches them to the appropriate MCPClient, appends the results
-        /// as "tool" role messages, and loops until the LLM produces a final
-        /// text answer or max_cycles is reached.
-        ///
-        /// @param messages  the conversation messages (mutated in-place).
-        /// @param max_cycles  maximum iterations before giving up.
-        /// @return the final text answer from the LLM.
         [[nodiscard]] AsyncTask<std::string>
         reason_act_loop(JSON& messages, int max_cycles = 10)
         {
@@ -353,10 +364,10 @@ namespace pooriayousefi::toar
 
                 JSON assistant_msg = std::move(*reasoning_result);
 
-                // Some local LLMs (llama.cpp) reject null content on assistant messages.
+                // CRITICAL FIX: Force content to be an empty string if missing/null.
                 if (!assistant_msg.contains("content") || assistant_msg["content"].is_null())
                 {
-                    assistant_msg["content"] = "";
+                    assistant_msg["content"] = std::string{""};
                 }
 
                 messages.push_back(assistant_msg);
@@ -391,30 +402,60 @@ namespace pooriayousefi::toar
                         );
                         JSON arguments = parsed_args.value_or(JSON{});
 
-                        std::println("{}", logger_.log(
-                            std::format("Dispatching tool: {}", tool_name)
-                        ));
-
-                        auto dispatch_result = co_await dispatch_tool(tool_name, arguments);
-
+                        // --- NEW: Inline Required Validation ---
+                        bool validation_failed = false;
                         std::string obs_str{};
-                        if (dispatch_result)
+
+                        auto schema_it = tool_schemas_.find(tool_name);
+                        if (schema_it != tool_schemas_.end() && 
+                            schema_it->second.contains("required") && 
+                            schema_it->second["required"].is_array())
                         {
-                            obs_str = std::move(*dispatch_result);
+                            for (const auto& req_key : schema_it->second["required"].get_array())
+                            {
+                                if (req_key.is_string() && !arguments.contains(req_key.get_string()))
+                                {
+                                    obs_str = std::format("Error: Missing required argument '{}'. Please try again.", req_key.get_string());
+                                    validation_failed = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!validation_failed)
+                        {
+                            std::println("{}", logger_.log(
+                                std::format("Dispatching tool: {}", tool_name)
+                            ));
+
+                            auto dispatch_result = co_await dispatch_tool(tool_name, arguments);
+
+                            if (dispatch_result)
+                            {
+                                obs_str = std::move(*dispatch_result);
+                            }
+                            else
+                            {
+                                obs_str = std::format("Error: {}", dispatch_result.error());
+                            }
+
+                            std::println("{}", logger_.log(
+                                std::format("Observation for {}: {}", tool_name, obs_str)
+                            ));
                         }
                         else
                         {
-                            obs_str = std::format("Error: {}", dispatch_result.error());
+                            std::println("{}", logger_.log(
+                                std::format("Validation failed for {}: {}", tool_name, obs_str)
+                            ));
                         }
-
-                        std::println("{}", logger_.log(
-                            std::format("Observation for {}: {}", tool_name, obs_str)
-                        ));
+                        // --- End Validation ---
 
                         JSON tool_msg;
                         tool_msg["role"] = "tool";
                         tool_msg["tool_call_id"] = tool_call_id;
-                        tool_msg["content"] = obs_str;
+                        // Ensure content is always a string
+                        tool_msg["content"] = obs_str.empty() ? std::string{"(no output)"} : obs_str;
                         messages.push_back(tool_msg);
                     }
                 }
@@ -445,13 +486,6 @@ namespace pooriayousefi::toar
         //  Chat (stateful multi-turn)
         // ----------------------------------------------------------------
 
-        /// @brief Multi-turn chat with persistent conversation history.
-        ///
-        /// Appends the user prompt to history, runs the ReAct loop,
-        /// syncs new messages back to history, and returns the final text.
-        ///
-        /// @param user_prompt  the user's input text.
-        /// @return the agent's final text response.
         [[nodiscard]] AsyncTask<std::string> chat(std::string_view user_prompt)
         {
             if (!user_prompt.empty())
@@ -466,7 +500,11 @@ namespace pooriayousefi::toar
 
             JSON sys_msg;
             sys_msg["role"] = "system";
-            sys_msg["content"] = config_.system_prompt;
+            // CRITICAL FIX: Provide a fallback system prompt and force string type
+            std::string sys_prompt = config_.system_prompt.empty() 
+                ? "You are a helpful assistant." 
+                : config_.system_prompt;
+            sys_msg["content"] = sys_prompt;
             messages.push_back(sys_msg);
 
             for (const auto& msg : history_)
